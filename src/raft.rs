@@ -251,6 +251,9 @@ impl RaftNode {
                         vote_granted = true;
                         self.voted_for = Some(candidate_id);
                         self.save_vote(ctx, candidate_id);
+                        // Granting a vote resets the election timer so the voter
+                        // does not immediately mount a rival candidacy.
+                        self.ticks_since_leader = 0;
                     }
                 }
 
@@ -273,13 +276,22 @@ impl RaftNode {
                 entries,
                 leader_commit,
             } => {
-                self.ticks_since_leader = 0;
                 if term > self.current_term {
                     self.step_down(ctx, term);
                 }
 
+                // The last log index this RPC establishes agreement on. The
+                // follower reports and bounds its commit by this, not by its own
+                // last_log_index, which may carry a stale divergent tail this
+                // RPC never confirmed.
+                let last_new_index = prev_log_index + entries.len() as i64;
                 let mut success = false;
                 if term >= self.current_term {
+                    // A current-term AppendEntries is from the live leader, so
+                    // reset the election timer even if the log check fails. A
+                    // stale-term one must not, or a deposed leader's heartbeat
+                    // would suppress a needed election.
+                    self.ticks_since_leader = 0;
                     self.role = Role::Follower;
                     let log_ok = if prev_log_index == -1 {
                         true
@@ -292,7 +304,7 @@ impl RaftNode {
                     if log_ok {
                         self.merge_entries(ctx, prev_log_index, &entries);
                         if leader_commit > self.commit_index {
-                            self.commit_index = leader_commit.min(self.last_log_index());
+                            self.commit_index = leader_commit.min(last_new_index);
                             self.apply_committed(ctx);
                         }
                         success = true;
@@ -304,7 +316,7 @@ impl RaftNode {
                     Message::AppendEntriesResponse {
                         term: self.current_term,
                         success,
-                        match_index: if success { self.last_log_index() } else { -1 },
+                        match_index: if success { last_new_index } else { -1 },
                     },
                 );
             }
@@ -345,6 +357,11 @@ impl RaftNode {
         }
         if term > self.current_term {
             self.step_down(ctx, term);
+            return;
+        }
+        // A response for anything but the current term is stale; drop it, or a
+        // grant from an earlier candidacy would count toward this one.
+        if term < self.current_term {
             return;
         }
         if vote_granted {
@@ -393,6 +410,11 @@ impl RaftNode {
         }
         if term > self.current_term {
             self.step_down(ctx, term);
+            return;
+        }
+        // A response for anything but the current term is stale; drop it, or a
+        // stale-term success would inflate match_index.
+        if term < self.current_term {
             return;
         }
         if !success {
