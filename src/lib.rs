@@ -1,6 +1,7 @@
 //! Quorum — deterministic bench for consensus inhabitants.
 
 pub mod ping_pong;
+pub mod raft;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -99,6 +100,7 @@ pub enum EventReason {
     Node,
     Tick,
     Message,
+    Client,
     Send,
     Save,
     Commit,
@@ -139,6 +141,11 @@ pub enum Input {
         input_id: InputId,
         to: NodeId,
     },
+    Client {
+        input_id: InputId,
+        to: NodeId,
+        payload: Value,
+    },
     Message {
         input_id: InputId,
         envelope: Envelope,
@@ -148,13 +155,16 @@ pub enum Input {
 impl Input {
     pub fn input_id(&self) -> InputId {
         match self {
-            Input::Tick { input_id, .. } | Input::Message { input_id, .. } => *input_id,
+            Input::Tick { input_id, .. }
+            | Input::Client { input_id, .. }
+            | Input::Message { input_id, .. } => *input_id,
         }
     }
 
     pub fn to(&self) -> NodeId {
         match self {
             Input::Tick { to, .. } => *to,
+            Input::Client { to, .. } => *to,
             Input::Message { envelope, .. } => envelope.to,
         }
     }
@@ -363,6 +373,32 @@ impl Simulator {
             EventKind::Partition,
             EventReason::Message,
             serde_json::json!({ "from": from, "to": to, "until": until }),
+        );
+    }
+
+    pub fn client_message<T: Serialize>(&mut self, to: NodeId, message: T) {
+        if self.nodes.get(&to).is_none_or(|node| node.crashed()) {
+            return;
+        }
+
+        let payload = serde_json::to_value(message).expect("serialize client message");
+        let input_id = self.next_input_id();
+        let mut event_payload = message_fields(&payload);
+        insert_field(&mut event_payload, "input_id", input_id);
+        insert_field(&mut event_payload, "to", to);
+        self.log_event(
+            Actor::Bench,
+            EventKind::Deliver,
+            EventReason::Client,
+            Value::Object(event_payload),
+        );
+        self.deliver_to(
+            to,
+            Input::Client {
+                input_id,
+                to,
+                payload,
+            },
         );
     }
 
@@ -628,6 +664,18 @@ impl Simulator {
                     EventKind::Receive,
                     EventReason::Tick,
                     serde_json::json!({ "parent_input_id": input_id }),
+                );
+            }
+            Input::Client {
+                input_id, payload, ..
+            } => {
+                let mut event_payload = message_fields(payload);
+                insert_field(&mut event_payload, "parent_input_id", input_id);
+                self.log_event(
+                    Actor::Node(node_id),
+                    EventKind::Receive,
+                    EventReason::Client,
+                    Value::Object(event_payload),
                 );
             }
             Input::Message { input_id, envelope } => {

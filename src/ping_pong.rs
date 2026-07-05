@@ -55,6 +55,9 @@ impl Node for PingPongNode {
                     Message::Pong { seq: _ } => {}
                 }
             }
+            Input::Client { .. } => {
+                panic!("ping/pong does not accept client input");
+            }
         }
     }
 
