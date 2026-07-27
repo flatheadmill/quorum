@@ -7,7 +7,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Protocol vocabulary
@@ -22,16 +22,9 @@ impl NodeId {
     pub const CLIENT: NodeId = NodeId(-1);
 }
 
-/// An election term. Raft is not active in this level, but the vocabulary stays
-/// because it is part of the consensus domain rather than Raft scaffolding.
+/// A position whose chosen value the world can check for agreement.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub struct Term(pub u64);
-
-impl Term {
-    pub fn next(self) -> Term {
-        Term(self.0 + 1)
-    }
-}
+pub struct Slot(pub u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct InputId(pub u64);
@@ -51,7 +44,7 @@ pub struct MessageId(pub u64);
 pub enum Desire {
     Send { to: NodeId, message: Value },
     Save { record: Value },
-    Commit { entry: Value },
+    Commit { slot: Slot, entry: Value },
 }
 
 // ---------------------------------------------------------------------------
@@ -215,9 +208,9 @@ impl<'a> Context<'a> {
         self.desires.push(Desire::Save { record });
     }
 
-    pub fn commit<T: Serialize>(&mut self, entry: T) {
+    pub fn commit<T: Serialize>(&mut self, slot: Slot, entry: T) {
         let entry = serde_json::to_value(entry).expect("serialize commit desire");
-        self.desires.push(Desire::Commit { entry });
+        self.desires.push(Desire::Commit { slot, entry });
     }
 }
 
@@ -277,7 +270,7 @@ impl Network {
         ready
     }
 
-    pub fn partition(&mut self, from: NodeId, to: NodeId, until_tick: u64) {
+    fn partition(&mut self, from: NodeId, to: NodeId, until_tick: u64) {
         self.partitions.insert((from, to), until_tick);
     }
 }
@@ -289,11 +282,11 @@ impl Network {
 pub struct SimulatorState {
     pub tick: u64,
     pub persistent: BTreeMap<NodeId, Vec<Value>>,
-    pub atomic_logs: BTreeMap<NodeId, Vec<Value>>,
+    pub atomic_logs: BTreeMap<NodeId, BTreeMap<Slot, Value>>,
     pub events: Vec<Event>,
     pub desires: Vec<Desire>,
     pub last_commit_tick: u64,
-    pub last_max_length: usize,
+    pub last_chosen_count: usize,
     pub next_input_id: u64,
     pub next_desire_id: u64,
     pub next_message_id: u64,
@@ -317,7 +310,7 @@ impl Simulator {
                 events: Vec::new(),
                 desires: Vec::new(),
                 last_commit_tick: 0,
-                last_max_length: 0,
+                last_chosen_count: 0,
                 next_input_id: 0,
                 next_desire_id: 0,
                 next_message_id: 0,
@@ -332,7 +325,7 @@ impl Simulator {
     pub fn spawn(&mut self, node_id: NodeId, node: Box<dyn Node>) {
         self.nodes.insert(node_id, node);
         self.state.persistent.insert(node_id, Vec::new());
-        self.state.atomic_logs.insert(node_id, Vec::new());
+        self.state.atomic_logs.insert(node_id, BTreeMap::new());
         self.log_event(
             Actor::Bench,
             EventKind::Spawn,
@@ -366,6 +359,10 @@ impl Simulator {
     }
 
     pub fn partition(&mut self, from: NodeId, to: NodeId, duration: u64) {
+        assert_ne!(
+            from, to,
+            "self-partition is invalid: a node cannot be partitioned from itself"
+        );
         let until = self.state.tick + duration;
         self.network.partition(from, to, until);
         self.log_event(
@@ -477,24 +474,6 @@ impl Simulator {
         true
     }
 
-    pub fn validate(&self) -> (bool, &'static str) {
-        if self.state.atomic_logs.is_empty() {
-            return (true, "No logs");
-        }
-
-        let logs: Vec<&Vec<Value>> = self.state.atomic_logs.values().collect();
-        let first = logs[0];
-
-        for log in &logs[1..] {
-            let min_len = first.len().min(log.len());
-            if first[..min_len] != log[..min_len] {
-                return (false, "Split brain detected");
-            }
-        }
-
-        (true, "Valid")
-    }
-
     pub fn log_event(&mut self, who: Actor, what: EventKind, why: EventReason, payload: Value) {
         self.state
             .events
@@ -587,7 +566,7 @@ impl Simulator {
                         }),
                     );
                 }
-                Desire::Commit { entry } => {
+                Desire::Commit { slot, entry } => {
                     self.log_event(
                         Actor::Node(node_id),
                         EventKind::Desire,
@@ -595,9 +574,10 @@ impl Simulator {
                         serde_json::json!({
                             "desire_id": desire_id,
                             "parent_input_id": parent_input_id,
+                            "slot": slot,
                         }),
                     );
-                    let index = self.append_commit(node_id, entry.clone());
+                    self.append_commit(node_id, slot, entry.clone());
                     self.log_event(
                         Actor::Bench,
                         EventKind::Commit,
@@ -605,7 +585,7 @@ impl Simulator {
                         serde_json::json!({
                             "desire_id": desire_id,
                             "node": node_id,
-                            "index": index,
+                            "slot": slot,
                             "entry": entry,
                         }),
                     );
@@ -614,25 +594,54 @@ impl Simulator {
         }
     }
 
-    fn append_commit(&mut self, node_id: NodeId, entry: Value) -> usize {
-        let log = self.state.atomic_logs.entry(node_id).or_default();
-        let index = log.len();
-        log.push(entry.clone());
+    fn append_commit(&mut self, node_id: NodeId, slot: Slot, entry: Value) {
+        // Commit is a one-shot claim that a slot is chosen. Even an identical
+        // second claim means the inhabitant's choose path fired twice.
+        //
+        // This refusal assumes no amnesia. Honest recovery in 002 will rebuild
+        // volatile apply state behind the durable log, so a recovered inhabitant
+        // may re-claim slots already recorded here. The recovery contract must
+        // decide whether that is a duplicate, an absorbed no-op, or a distinct
+        // re-learned event before recovery scenarios can rely on this check.
+        if let Some(previous) = self
+            .state
+            .atomic_logs
+            .get(&node_id)
+            .and_then(|log| log.get(&slot))
+        {
+            if previous == &entry {
+                panic!(
+                    "duplicate commit at slot {}: node {:?} committed {:?} twice",
+                    slot.0, node_id, entry
+                );
+            }
+            panic!(
+                "self split brain at slot {}: node {:?} committed {:?}, then {:?}",
+                slot.0, node_id, previous, entry
+            );
+        }
 
+        // Agreement is checked as each claim enters the world; the old batch
+        // validate pass would only repeat this check after the fact.
         for (&other_id, other_log) in self.state.atomic_logs.iter() {
             if other_id == node_id {
                 continue;
             }
-            if other_log.len() > index && other_log[index] != entry {
+            if let Some(other_entry) = other_log.get(&slot)
+                && other_entry != &entry
+            {
                 panic!(
-                    "split brain at index {}: node {:?} committed {:?}, node {:?} committed {:?}",
-                    index, node_id, entry, other_id, other_log[index]
+                    "split brain at slot {}: node {:?} committed {:?}, node {:?} committed {:?}",
+                    slot.0, node_id, entry, other_id, other_entry
                 );
             }
         }
 
-        self.state.last_commit_tick = self.state.tick;
-        index
+        self.state
+            .atomic_logs
+            .entry(node_id)
+            .or_default()
+            .insert(slot, entry);
     }
 
     fn check_progress(&mut self) -> bool {
@@ -640,16 +649,16 @@ impl Simulator {
             return false;
         }
 
-        let max_length = self
+        let chosen_count = self
             .state
             .atomic_logs
             .values()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0);
+            .flat_map(|log| log.keys().copied())
+            .collect::<BTreeSet<_>>()
+            .len();
 
-        if max_length > self.state.last_max_length {
-            self.state.last_max_length = max_length;
+        if chosen_count > self.state.last_chosen_count {
+            self.state.last_chosen_count = chosen_count;
             return true;
         }
 
@@ -739,4 +748,107 @@ fn insert_field<T: Serialize>(fields: &mut Map<String, Value>, key: &str, value:
         key.to_string(),
         serde_json::to_value(value).expect("serialize event field"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[derive(Default)]
+    struct SilentNode {
+        crashed: bool,
+    }
+
+    impl Node for SilentNode {
+        fn receive(&mut self, _ctx: &mut Context, _input: &Input) {}
+
+        fn crashed(&self) -> bool {
+            self.crashed
+        }
+
+        fn set_crashed(&mut self, crashed: bool) {
+            self.crashed = crashed;
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate commit at slot 7")]
+    fn refuses_identical_second_commit_from_one_node() {
+        let mut sim = Simulator::new(0, 100, 1);
+        sim.append_commit(NodeId(0), Slot(7), json!("alpha"));
+        sim.append_commit(NodeId(0), Slot(7), json!("alpha"));
+    }
+
+    #[test]
+    #[should_panic(expected = "self split brain at slot 7")]
+    fn refuses_conflicting_second_commit_from_one_node() {
+        let mut sim = Simulator::new(0, 100, 1);
+        sim.append_commit(NodeId(0), Slot(7), json!("alpha"));
+        sim.append_commit(NodeId(0), Slot(7), json!("beta"));
+    }
+
+    #[test]
+    #[should_panic(expected = "split brain at slot 7")]
+    fn refuses_cross_node_disagreement() {
+        let mut sim = Simulator::new(0, 100, 1);
+        sim.append_commit(NodeId(0), Slot(7), json!("alpha"));
+        sim.append_commit(NodeId(1), Slot(7), json!("beta"));
+    }
+
+    #[test]
+    fn permits_cross_node_agreement() {
+        let mut sim = Simulator::new(0, 100, 1);
+        sim.append_commit(NodeId(0), Slot(7), json!("alpha"));
+        sim.append_commit(NodeId(1), Slot(7), json!("alpha"));
+
+        assert_eq!(sim.state.atomic_logs[&NodeId(1)][&Slot(7)], json!("alpha"));
+    }
+
+    #[test]
+    fn permits_different_values_in_disjoint_slots() {
+        let mut sim = Simulator::new(0, 100, 1);
+        sim.append_commit(NodeId(0), Slot(0), json!("alpha"));
+        sim.append_commit(NodeId(1), Slot(1), json!("beta"));
+
+        assert_eq!(sim.state.atomic_logs[&NodeId(0)][&Slot(0)], json!("alpha"));
+        assert_eq!(sim.state.atomic_logs[&NodeId(1)][&Slot(1)], json!("beta"));
+    }
+
+    #[test]
+    fn progress_counts_distinct_chosen_slots() {
+        let mut sim = Simulator::new(0, 100, 1);
+
+        sim.append_commit(NodeId(0), Slot(7), json!("alpha"));
+        assert!(sim.check_progress());
+
+        sim.append_commit(NodeId(1), Slot(7), json!("alpha"));
+        assert!(!sim.check_progress());
+
+        sim.append_commit(NodeId(1), Slot(3), json!("beta"));
+        assert!(sim.check_progress());
+        assert_eq!(sim.state.last_chosen_count, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "a node cannot be partitioned from itself")]
+    fn refuses_self_partition() {
+        Simulator::new(0, 100, 1).partition(NodeId(1), NodeId(1), 10);
+    }
+
+    #[test]
+    fn deadlock_event_fires_after_threshold_without_progress() {
+        let mut sim = Simulator::new(0, 2, 1);
+        sim.spawn(NodeId(0), Box::new(SilentNode::default()));
+
+        assert!(sim.run(2));
+        assert!(!sim.run(3));
+
+        let event = sim.state.events.last().expect("deadlock event");
+        assert_eq!(event.when, 3);
+        assert!(matches!(event.who, Actor::Bench));
+        assert!(matches!(event.what, EventKind::Deadlock));
+        assert!(matches!(event.why, EventReason::NoProgress));
+        assert_eq!(event.payload["ticks_since_progress"], json!(3));
+    }
 }

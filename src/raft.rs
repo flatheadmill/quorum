@@ -8,7 +8,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Context, Input, Node, NodeId, Term};
+use crate::{Context, Input, Node, NodeId, Slot};
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+struct Term(u64);
+
+impl Term {
+    fn next(self) -> Term {
+        Term(self.0 + 1)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -454,7 +463,9 @@ impl RaftNode {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let (_, entry) = &self.log[self.last_applied as usize];
-            ctx.commit(entry.clone());
+            // Raft owns the -1 sentinel. After increment, last_applied is a
+            // real log index, so only a non-negative slot crosses the seam.
+            ctx.commit(Slot(self.last_applied as u64), entry.clone());
         }
     }
 }
