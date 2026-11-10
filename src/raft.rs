@@ -511,3 +511,77 @@ impl Node for RaftNode {
         self.is_crashed = crashed;
     }
 }
+
+#[cfg(test)]
+mod tape_diagnostic {
+    use super::*;
+    use crate::{
+        projection::Tape,
+        replay::{self, Mode},
+        scenarios, tape,
+    };
+    use serde_json::json;
+    use std::{cell::RefCell, io, rc::Rc};
+
+    struct Observed {
+        node: RaftNode,
+        observations: Rc<RefCell<Vec<Value>>>,
+    }
+    impl Node for Observed {
+        fn receive(&mut self, ctx: &mut Context, input: &Input) {
+            self.node.receive(ctx, input);
+            self.observations.borrow_mut().push(json!({"node":self.node.node_id,"input_id":input.input_id(),"role":format!("{:?}",self.node.role)}));
+        }
+        fn crashed(&self) -> bool {
+            self.node.crashed()
+        }
+        fn set_crashed(&mut self, value: bool) {
+            self.node.set_crashed(value);
+        }
+    }
+    #[test]
+    fn reopen_with_one_new_observation_without_changing_protocol_answers() {
+        let sim = scenarios::capture("raft", Box::new(io::sink())).unwrap();
+        let bytes = tape::encode(sim.rows());
+        let source = Tape::read(&bytes).unwrap();
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let report = replay::replay(&source, Mode::Diagnostic, |spec| {
+            let count = spec.config["count"].as_i64().unwrap() as i32;
+            let timeout = spec.config["election_timeout"].as_u64().unwrap();
+            Ok(Box::new(Observed {
+                node: RaftNode::with_election_timeout(spec.node, count, timeout),
+                observations: observations.clone(),
+            }))
+        })
+        .unwrap();
+        assert_eq!(report.completed_answers, source.projection.inputs.len());
+        assert_eq!(observations.borrow().len(), report.dispatched_inputs);
+        assert!(observations.borrow().iter().any(|v| v["role"] == "Leader"));
+        assert!(
+            !String::from_utf8(bytes.clone())
+                .unwrap()
+                .contains("\"role\"")
+        );
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/slice2-evidence");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut diagnostics = String::new();
+        for observation in observations.borrow().iter() {
+            diagnostics.push_str(
+                &json!({"source_sha256":source.sha256,"observation":observation}).to_string(),
+            );
+            diagnostics.push('\n');
+        }
+        std::fs::write(
+            directory.join(format!("{}.diagnostics.jsonl", source.sha256)),
+            diagnostics,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(format!("{}.source.jsonl", source.sha256)),
+            bytes.clone(),
+        )
+        .unwrap();
+        assert_eq!(tape::hash(&bytes), source.sha256);
+    }
+}

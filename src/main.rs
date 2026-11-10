@@ -1,61 +1,78 @@
-use quorum::ping_pong::PingPongNode;
-use quorum::raft::{RaftNode, propose};
-use quorum::{NodeId, Simulator};
+use quorum::{
+    Result,
+    projection::{Projection, Tape},
+    replay::{self, Mode},
+    scenarios, vote,
+};
 use serde_json::json;
-use std::env;
+use std::{env, fs, io};
 
+fn run() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(String::as_str).unwrap_or("raft") {
+        "raft" | "ping-pong" => {
+            scenarios::capture(
+                args.first().map(String::as_str).unwrap_or("raft"),
+                Box::new(io::stdout()),
+            )?;
+        }
+        "capture" => {
+            if args.len() != 3 {
+                return Err("usage: quorum capture <raft|ping-pong> <tape.jsonl>".into());
+            }
+            // Validate the requested scenario before opening its output path.
+            scenarios::header(&args[1])?;
+            let output = fs::File::create(&args[2]).map_err(|e| e.to_string())?;
+            let sim = scenarios::capture(&args[1], Box::new(output))?;
+            println!("{}", sim.check_projection()?.summary());
+        }
+        "inspect" | "replay" | "diagnose" | "vote" | "prefixes" => {
+            if args.len() != 2 {
+                return Err(
+                    "usage: quorum <inspect|replay|diagnose|vote|prefixes> <tape.jsonl>".into(),
+                );
+            }
+            let bytes = fs::read(&args[1]).map_err(|e| e.to_string())?;
+            let tape = Tape::read(&bytes)?;
+            let report = match args[0].as_str() {
+                "inspect" => {
+                    json!({"source_sha256":tape.sha256,"projection":tape.projection.summary()})
+                }
+                "replay" | "diagnose" => serde_json::to_value(replay::replay(
+                    &tape,
+                    if args[0] == "replay" {
+                        Mode::Strict
+                    } else {
+                        Mode::Diagnostic
+                    },
+                    scenarios::factory,
+                )?)
+                .unwrap(),
+                "vote" => serde_json::to_value(vote::verify(&tape)?).unwrap(),
+                "prefixes" => {
+                    let mut classes = std::collections::BTreeMap::new();
+                    for end in 0..=tape.rows.len() {
+                        let p = Projection::from_rows(&tape.rows[..end])?;
+                        *classes.entry(p.tail()).or_insert(0usize) += 1;
+                    }
+                    json!({"source_sha256":tape.sha256,"prefixes":tape.rows.len()+1,"tail_classes":classes})
+                }
+                _ => unreachable!(),
+            };
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
+        _ => {
+            return Err(
+                "usage: quorum [raft|ping-pong|capture|inspect|replay|diagnose|vote|prefixes]"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
 fn main() {
-    let scenario = env::args().nth(1).unwrap_or_else(|| "raft".to_string());
-    let sim = match scenario.as_str() {
-        "raft" => run_raft(),
-        "ping-pong" => run_ping_pong(),
-        other => panic!("unknown scenario {other:?}; expected raft or ping-pong"),
-    };
-
-    for event in sim.state.events {
-        println!("{}", serde_json::to_string(&event).unwrap());
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
-}
-
-fn run_raft() -> Simulator {
-    let node_count = 2;
-    let mut sim = Simulator::new(42, 200, 1);
-    sim.network.base_latency = 1;
-    sim.network.jitter = 0;
-
-    let max_latency = sim.network.base_latency + sim.network.jitter;
-    let timeout_base = 15;
-    let timeout_margin = 1;
-    let timeout_stride = max_latency + timeout_margin;
-
-    for id in 0..node_count {
-        let node_id = NodeId(id);
-        let election_timeout = timeout_base + (id as u64 * timeout_stride);
-        sim.spawn(
-            node_id,
-            Box::new(RaftNode::with_election_timeout(
-                node_id,
-                node_count,
-                election_timeout,
-            )),
-        );
-    }
-
-    sim.run(25);
-    sim.client_message(NodeId(0), propose(json!("alpha")));
-    sim.run(40);
-    sim
-}
-
-fn run_ping_pong() -> Simulator {
-    let node_count = 2;
-    let mut sim = Simulator::new(42, 1_000, 1);
-
-    for id in 0..node_count {
-        let node_id = NodeId(id);
-        sim.spawn(node_id, Box::new(PingPongNode::new(node_id, node_count)));
-    }
-
-    sim.run(40);
-    sim
 }
