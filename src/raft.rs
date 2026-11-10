@@ -76,9 +76,8 @@ pub struct RaftNode {
     quorum_size: i32,
     is_crashed: bool,
 
-    // Persistent state (Raft paper Figure 2). The bench can record saves, but
-    // it cannot yet rebuild this state on recover. That gap is inventoried on
-    // Codex's shelf.
+    // Persistent state (Raft paper Figure 2). The bench records saves, but
+    // honest recovery still needs to rebuild this state from fulfilled records.
     current_term: Term,
     voted_for: Option<NodeId>,
     log: Vec<(Term, Value)>,
