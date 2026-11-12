@@ -10,7 +10,7 @@ use std::{env, fs, io};
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("raft") {
-        "raft" | "ping-pong" => {
+        "raft" | "ping-pong" | "calm" => {
             scenarios::capture(
                 args.first().map(String::as_str).unwrap_or("raft"),
                 Box::new(io::stdout()),
@@ -18,7 +18,7 @@ fn run() -> Result<()> {
         }
         "capture" => {
             if args.len() != 3 {
-                return Err("usage: quorum capture <raft|ping-pong> <tape.jsonl>".into());
+                return Err("usage: quorum capture <raft|ping-pong|calm> <tape.jsonl>".into());
             }
             // Validate the requested scenario before opening its output path.
             scenarios::header(&args[1])?;
@@ -63,7 +63,7 @@ fn run() -> Result<()> {
         }
         _ => {
             return Err(
-                "usage: quorum [raft|ping-pong|capture|inspect|replay|diagnose|vote|prefixes]"
+                "usage: quorum [raft|ping-pong|calm|capture|inspect|replay|diagnose|vote|prefixes]"
                     .into(),
             );
         }

@@ -1,4 +1,4 @@
-# Complete simulator tape — level 003, slice 2
+# Complete simulator tape — level 003
 
 The simulator writes and flushes each complete JSONL row before projecting its
 world effect into memory. The file is authoritative; retained rows, per-node
@@ -40,7 +40,7 @@ cargo run --locked -- replay target/raft.jsonl
 cargo run --locked -- vote target/raft.jsonl
 ```
 
-`quorum raft` and `quorum ping-pong` also stream directly to stdout. `capture`
+`quorum raft`, `quorum ping-pong`, and `quorum calm` also stream directly to stdout. `capture`
 writes its tape path and prints the final projection summary on stdout.
 `inspect`, `prefixes`, `replay`, and `vote` consume the file without modifying it.
 Errors go to stderr with a failing exit status. Reports hash the original bytes
@@ -60,6 +60,78 @@ validation transcript and source manifest there, and captures both scenarios twi
 row-boundary prefixes, replays both, checks Raft votes, and runs representative
 `jq` queries. Generated artifacts are local, ignored build output; they are not
 published.
+
+## Multi-Paxos Calm
+
+```sh
+cargo run --locked -- capture calm target/calm.jsonl
+cargo run --locked -- inspect target/calm.jsonl
+cargo run --locked -- replay target/calm.jsonl
+cargo run --locked -- prefixes target/calm.jsonl
+CARGO_HOME=/private/tmp/quorum-slice2-cargo bash scripts/check-calm.sh
+```
+
+Calm uses nodes 0, 1 and 2 as acceptors, learners and eligible proposers, with
+only node 0 active. Node configuration records those role memberships,
+`active_proposer`, `from_slot: 0`, `initial_round: 1`, and
+`initial_state: "empty"`. Quorum is derived from the acceptor set. The header
+and node acceptor sets come from the same scenario membership. A null active
+proposer disables campaigning in receiver fixtures; it does not make an
+otherwise configured proposer ineligible to send owned protocol messages.
+
+The seed is 42, latency is 1 with no jitter, ticks occur every step, and the
+no-progress threshold is 200. Three tick-zero client commands queue alpha,
+beta and gamma. The first Tick starts one fixed-suffix Prepare campaign,
+including self through the network. The first distinct Promise quorum
+freezes adoption at tick 3 and issues the three Accept broadcasts without
+another Prepare. Fulfilled acceptance quorums exist at tick 4; proposer
+knowledge and claims follow at tick 5, and other learners claim at tick 6.
+Tick 8 finalizes with reason `horizon` and an empty unfinished-work account.
+
+`src/multi_paxos.rs` owns ballots, protocol parsing and transitions:
+`start_campaign`/`prepare`/`promise` cover Phase 1,
+`receive_promise` freezes the quorum, and `propose_waiting` interleaves
+adopted slots with FIFO clients without consuming a client for an adoption.
+All reports' slot/ballot values are retained until freeze so even a
+lower-ballot contradiction cannot hide behind a higher report.
+`accept` orders persistence before acknowledgment; `receive_accepted`
+licenses Commit/Chosen from distinct matching replies. `learn` guards both
+learning paths, including self-Chosen and the same value under a later ballot.
+Commit carries the JSON value alone, including null. Claims may be sparse;
+they are not in-order application. Nack never triggers retry or abandonment.
+
+The evidence script replaces `target/calm-evidence/` and invokes
+`scripts/check-slice2.sh`, which also replaces its own generated directory.
+It runs formatting checks, all tests, clippy and build; retains the existing
+Raft/Ping-Pong evidence; compares a fresh `capture calm` with a fresh direct
+`calm` execution; then checks public replay, projection and every complete-row
+prefix. Its outputs include:
+
+- `calm.a.jsonl` and `calm.b.jsonl`: byte-identical complete captures.
+- `calm.replay.json` and `calm.prefixes.json`: public validation reports.
+- `calm.chosen-before-known.jsonl` and its inspection report: the original
+  bytes through the second matching fulfilled acceptance for slot 0, before
+  any Accepted dispatch or Commit desire. This cut is an interrupted drain,
+  not a finalized scenario.
+- `evidence-map.json`: one-based tape lines for campaign, freeze, choice cut,
+  quorum/Commit/Chosen, self-Chosen suppression and finalization, plus source
+  anchors and the implementation identity.
+- `receiver-*.jsonl`, `.evidence.json`, `.replay.json`, and `.prefixes.json`:
+  real-node/scripted-peer transition fixtures, including adoption/FIFO
+  controls, stale/repeat precedence, Nack outcomes and required null fields.
+- `source-manifest.sha256`, `tape-hashes.sha256`, and `validation.txt`.
+
+Receiver peers are reconstructed from recorded test-local configuration by
+`tests/multi_paxos.rs`; they deliberately have no public CLI factory. Each
+fixture interprets every row prefix and strictly replays its closed portion.
+Deliberate conflicting-value and malformed-input panics retain their open
+invocation; their `.closed-prefix.jsonl` and replay report certify only the
+preceding closed portion, not the panicking input.
+
+The fixtures establish receiver behavior, not globally legal Paxos histories.
+The choice cut is the declared workload's hand-worked protocol interpretation.
+Neither these observations nor strict replay is the independent Certificate
+Verifier; that verifier and Duel remain outside Calm.
 
 ## Schema 1
 
@@ -214,7 +286,7 @@ format or a distributed merger.
 
 ## Boundary
 
-No Multi-Paxos inhabitant, honest recovery, socket adapter, physical WAL,
+No Certificate Verifier, Duel, honest recovery, socket adapter, physical WAL,
 distributed merger, timeout-policy redesign, or Apply witness is included.
 `recover` preserves the old flag-flip behavior and explicitly labels it
 `retained_state`; its tape is not evidence of correct restart behavior. Future

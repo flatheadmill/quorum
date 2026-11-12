@@ -2,6 +2,7 @@
 use crate::tape::{Header, NodeSpec, WorldConfig};
 use crate::{
     Node, NodeId, Result, Simulator,
+    multi_paxos::{self, MultiPaxosNode},
     ping_pong::PingPongNode,
     raft::{RaftNode, propose},
 };
@@ -43,6 +44,11 @@ pub fn factory(spec: &NodeSpec) -> Result<Box<dyn Node>> {
             }
             Ok(Box::new(PingPongNode::new(spec.node, c.count)))
         }
+        "multi-paxos" => {
+            let config: multi_paxos::Config =
+                serde_json::from_value(spec.config.clone()).map_err(|e| e.to_string())?;
+            Ok(Box::new(MultiPaxosNode::new(spec.node, config)?))
+        }
         other => Err(format!("no factory for algorithm {other}")),
     }
 }
@@ -80,9 +86,39 @@ pub fn header(scenario: &str) -> Result<Header> {
                 .collect(),
             vec![],
         ),
+        "calm" => {
+            let membership = vec![NodeId(0), NodeId(1), NodeId(2)];
+            let config = json!({
+                "acceptors": membership,
+                "learners": membership,
+                "proposers": membership,
+                "active_proposer": 0,
+                "from_slot": 0,
+                "initial_round": 1,
+                "initial_state": "empty",
+            });
+            let nodes = membership
+                .iter()
+                .map(|&node| NodeSpec {
+                    node,
+                    algorithm: "multi-paxos".into(),
+                    config: config.clone(),
+                })
+                .collect();
+            (
+                WorldConfig {
+                    base_latency: 1,
+                    jitter: 0,
+                    tick_interval: 1,
+                    deadlock_threshold: 200,
+                },
+                nodes,
+                membership,
+            )
+        }
         _ => {
             return Err(format!(
-                "unknown scenario {scenario:?}; expected raft or ping-pong"
+                "unknown scenario {scenario:?}; expected raft, ping-pong or calm"
             ));
         }
     };
@@ -94,6 +130,14 @@ pub fn capture(scenario: &str, output: Box<dyn Write>) -> Result<Simulator> {
     let mut sim = Simulator::new(header, output)?;
     for spec in &specs {
         sim.spawn(spec.node, factory(spec)?)?;
+    }
+    if scenario == "calm" {
+        for value in ["alpha", "beta", "gamma"] {
+            sim.client_message(NodeId(0), multi_paxos::propose(json!(value)))?;
+        }
+        let progressed = sim.run(8)?;
+        sim.finalize(if progressed { "horizon" } else { "no_progress" })?;
+        return Ok(sim);
     }
     if scenario == "raft" {
         if !sim.run(25)? {
