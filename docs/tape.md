@@ -380,8 +380,17 @@ Learning a slot/value and announcing a completed proposal are separate
 transitions. A learner that later completes its own proposal for that value
 suppresses the duplicate Commit but still broadcasts Chosen to its configured
 learners. Further Accepted replies for that exact completed proposal do not
-repeat the broadcast. Receiver conformance remains separate from each claim's
-header-based local and transitive evidence.
+repeat the broadcast. For receiver conformance, matching Accepted inputs count
+only when dispatched after the close of the answer that first issued the exact
+proposal. An earlier dispatch is not carried forward; a later dispatch from
+that same acceptor can count. A reply sent before issuance but dispatched after
+that close still counts. This timing rule does not filter either claim
+proposition: earlier received testimony remains eligible for header-based
+local and transitive evidence.
+Only unreadable peer inputs dispatched after issuance can leave a below-quorum
+receiver judgment indeterminate, and each cited gap must exist in the
+interpretation findings. Earlier peer findings and malformed client inputs
+remain in the report without making that proposal's reply count uncertain.
 
 Attempt `origin.kind` is `adopted`, `fresh`, or `undetermined`.
 `allocation_line` is the close containing the first Accept desire; its
@@ -477,6 +486,17 @@ judgments alongside the self-contained regressions.
 Its checksummed learned-then-own-quorum, header-mismatch, signed-zero control
 pair and five honest-history samples are read-only inputs. Certificate joins
 use the same value equality rather than textual number spelling.
+If that bundle includes `SHA256SUMS.postaccept`, the command also checks its
+early-Accepted/control tapes and probe source without changing them. The pair
+must have established receiver conformance while preserving early testimony
+in claim evidence. Self-contained regressions additionally cover a whole early
+quorum, a repeated member after issuance, and pre-issuance Send admission with
+post-issuance dispatch, plus unreadable replies on each side of the issuance
+boundary.
+The optional `SHA256SUMS.timing` manifest supplies the immutable prequorum,
+repeated-member, same-tick, delayed-dispatch and unreadable-input controls.
+Its malformed-client probe must retain the client finding while establishing
+receiver conformance at line 138 with no reply gap.
 The command also requires every indeterminate obligation to carry a real gap
 or located unavailable dependency.
 The command runs the existing regression checks and independent counterexamples,
@@ -489,6 +509,8 @@ JSON/human output and original one-based citations, and writes:
   unsupported owner, and real adoption history.
 - `review-judgments.json` and `review-inputs.sha256` when review inputs are supplied.
 - `audit-judgments.json` and `audit-inputs.sha256` when audit inputs are supplied.
+- `postaccept-judgments.json` when the post-acceptance audit manifest is supplied.
+- `timing-judgments.json` when the timing audit manifest is supplied.
 - `interpretation-gap-dependencies.json`.
 - `manifest.json`, `source-manifest.sha256`, and `retained-inputs.sha256`,
   fixing the source base/status, interpretation and original evidence identities.

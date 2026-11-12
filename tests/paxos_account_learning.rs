@@ -437,3 +437,289 @@ fn duplicate_accepted_replies_neither_supply_quorum_nor_repeat_announcements() {
         );
     }
 }
+
+#[test]
+fn accepted_replies_count_only_after_the_exact_proposal_is_issued() {
+    let accepted = message("accepted", [2, 0], 0, "x");
+    let promise = json!({"type":"promise","ballot":[2,0],"from_slot":0,"accepted":[]});
+    for (name, early_members, first_reply, queued_before_issue) in [
+        ("learning-early-accepted", &[1][..], 2, false),
+        ("learning-control-accepted", &[][..], 1, false),
+        ("learning-early-accepted-quorum", &[1, 2][..], 2, false),
+        (
+            "learning-accepted-member-repeats-after-issue",
+            &[1][..],
+            1,
+            false,
+        ),
+        ("learning-accepted-sent-before-issue", &[][..], 1, true),
+        ("learning-unreadable-client-after-issue", &[][..], 1, false),
+    ] {
+        let mut programs = [
+            vec![vec![promise.clone()], vec![accepted.clone()]],
+            vec![vec![promise.clone()], vec![accepted.clone()]],
+            vec![vec![accepted.clone()]],
+        ];
+        for member in early_members {
+            programs[*member as usize - 1].insert(0, vec![accepted.clone()]);
+        }
+        let mut nodes = vec![spec(0, &[1, 2, 3], &[0], &[0, 1, 2], Some(0), 2)];
+        nodes.extend(
+            programs
+                .iter()
+                .enumerate()
+                .map(|(index, batches)| NodeSpec {
+                    node: NodeId(index as i32 + 1),
+                    algorithm: "receiver-script".into(),
+                    config: json!({"batches":batches}),
+                }),
+        );
+        let mut sim = simulator(name, nodes.clone(), &[1, 2, 3]);
+        let proposer = scenarios::factory(&nodes[0]).unwrap();
+        sim.spawn(
+            NodeId(0),
+            if name == "learning-unreadable-client-after-issue" {
+                Box::new(IgnoreMalformedClient(proposer))
+            } else {
+                proposer
+            },
+        )
+        .unwrap();
+        for (index, batches) in programs.into_iter().enumerate() {
+            sim.spawn(
+                NodeId(index as i32 + 1),
+                Box::new(Peer {
+                    batches: batches.into(),
+                    crashed: false,
+                }),
+            )
+            .unwrap();
+        }
+        sim.client_message(NodeId(0), propose(json!("x"))).unwrap();
+        sim.run(1).unwrap();
+        for member in early_members {
+            sim.client_message(NodeId(*member), Value::Null).unwrap();
+        }
+        sim.run(3).unwrap();
+        for member in [1, 2] {
+            sim.client_message(NodeId(member), Value::Null).unwrap();
+        }
+        if queued_before_issue {
+            sim.client_message(NodeId(first_reply), Value::Null)
+                .unwrap();
+        }
+        sim.run(5).unwrap();
+        if name == "learning-unreadable-client-after-issue" {
+            sim.client_message(NodeId(0), json!({"type":"propose"}))
+                .unwrap();
+        }
+        if !queued_before_issue {
+            sim.client_message(NodeId(first_reply), Value::Null)
+                .unwrap();
+        }
+        sim.run(7).unwrap();
+        sim.client_message(NodeId(3), Value::Null).unwrap();
+        sim.run(10).unwrap();
+        sim.finalize("horizon").unwrap();
+
+        let rows = sim.rows();
+        let report = capture(name, rows);
+        let proposal = lines(rows, |row| {
+            row.what == "desire"
+                && row.why == "send"
+                && row.fields["node"] == 0
+                && row.fields["message"] == message("accept", [2, 0], 0, "x")
+        })[0];
+        let issuing_input = &rows[proposal - 1].fields["parent_input_id"];
+        let issued = lines(rows, |row| {
+            row.what == "close" && row.fields["input_id"] == *issuing_input
+        })[0];
+        let replies = lines(rows, |row| {
+            row.what == "dispatch"
+                && row.why == "message"
+                && row.fields["to"] == 0
+                && row.fields["message"] == accepted
+        });
+        assert_eq!(replies.len(), early_members.len() + 2, "{name}");
+        let early = &replies[..early_members.len()];
+        let genuine = &replies[early_members.len()..];
+        for dispatch in early {
+            assert!(*dispatch < proposal, "{name}");
+            assert!(answer(rows, *dispatch).is_empty(), "{name}");
+            receiver(&report, close_line(rows, *dispatch));
+        }
+        assert!(issued < genuine[0] && genuine[0] < genuine[1], "{name}");
+        assert_eq!(rows[genuine[0] - 1].fields["from"], first_reply);
+        assert_eq!(rows[genuine[1] - 1].fields["from"], 3);
+        if queued_before_issue {
+            let send = lines(rows, |row| {
+                row.what == "attempt"
+                    && row.why == "send"
+                    && row.fields["node"] == first_reply
+                    && row.fields["message"] == accepted
+            })[0];
+            assert!(send < issued, "{name}");
+        }
+        assert!(answer(rows, genuine[0]).is_empty(), "{name}");
+        let first = receiver(&report, close_line(rows, genuine[0]));
+        cited(first, &[proposal, issued, genuine[0]]);
+        assert_eq!(
+            answer(rows, genuine[1]),
+            vec![
+                Desire::Commit {
+                    slot: Slot(0),
+                    entry: json!("x")
+                },
+                Desire::Send {
+                    to: NodeId(0),
+                    message: message("chosen", [2, 0], 0, "x")
+                },
+            ],
+            "{name}"
+        );
+        let quorum = receiver(&report, close_line(rows, genuine[1]));
+        cited(quorum, &[proposal, issued, genuine[0], genuine[1]]);
+        for proposition in [first, quorum] {
+            for dispatch in early {
+                assert!(
+                    !proposition["support"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(dispatch)),
+                    "{name}: {proposition}"
+                );
+            }
+        }
+        assert!(
+            report["obligations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["verdict"] != "violated"),
+            "{name}: {}",
+            report["obligations"]
+        );
+        assert!(
+            report["obligations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["proposition"] == "receiver_conformance")
+                .all(|p| p["verdict"] == "established"),
+            "{name}"
+        );
+        assert!(report["choices"].as_array().unwrap().is_empty());
+        let claims = report["claims"].as_array().unwrap();
+        assert_eq!(claims.len(), 2, "{name}");
+        for claim in claims {
+            assert_eq!(claim["local_basis"]["verdict"], "established", "{name}");
+            assert_eq!(
+                claim["transitive_support"]["verdict"], "indeterminate",
+                "{name}"
+            );
+            // Proposal timing must not remove received testimony from knowledge.
+            cited(&claim["local_basis"], early);
+        }
+        if name == "learning-unreadable-client-after-issue" {
+            let dispatch = lines(rows, |row| {
+                row.what == "dispatch"
+                    && row.why == "client"
+                    && row.fields["to"] == 0
+                    && row.fields["message"] == json!({"type":"propose"})
+            })[0];
+            assert!(issued < dispatch && dispatch < genuine[0]);
+            let gap = format!("client:{}", rows[dispatch - 1].fields["input_id"]);
+            assert!(
+                report["interpretation_findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["id"] == gap
+                            && finding["occurrence_lines"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&json!(dispatch))
+                    })
+            );
+        }
+        if name == "learning-early-accepted" {
+            for (case, dispatch, uncertain) in [
+                ("learning-unreadable-accepted-before-issue", early[0], false),
+                ("learning-unreadable-accepted-after-issue", genuine[0], true),
+            ] {
+                let mut damaged = rows.to_vec();
+                let desire = &rows[dispatch - 1].fields["parent_desire_id"];
+                for row in &mut damaged {
+                    if row.fields.get("desire_id") == Some(desire)
+                        || row.fields.get("parent_desire_id") == Some(desire)
+                    {
+                        row.fields.insert(
+                            "message".into(),
+                            json!({"type":"accepted","ballot":[2,0],"slot":0}),
+                        );
+                    }
+                }
+                let damaged_report = capture(case, &damaged);
+                if uncertain {
+                    let boundary = close_line(&damaged, genuine[1]);
+                    let response = damaged_report["obligations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|p| {
+                            p["proposition"] == "receiver_conformance"
+                                && p["boundary_line"] == boundary
+                        })
+                        .unwrap();
+                    assert_eq!(response["verdict"], "indeterminate", "{response}");
+                    assert!(
+                        damaged_report["interpretation_findings"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|finding| {
+                                response["gaps"]
+                                    .as_array()
+                                    .unwrap()
+                                    .contains(&finding["id"])
+                                    && finding["occurrence_lines"]
+                                        .as_array()
+                                        .unwrap()
+                                        .contains(&json!(dispatch))
+                            }),
+                        "{response}"
+                    );
+                } else {
+                    for dispatch in genuine {
+                        receiver(&damaged_report, close_line(&damaged, *dispatch));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Keep the actual proposer transition for readable inputs while allowing the
+// account to observe continued history after a malformed client input.
+struct IgnoreMalformedClient(Box<dyn Node>);
+
+impl Node for IgnoreMalformedClient {
+    fn receive(&mut self, ctx: &mut Context, input: &Input) {
+        if let Input::Client { payload, .. } = input
+            && payload.get("type").and_then(Value::as_str) == Some("propose")
+            && payload.get("value").is_none()
+        {
+            return;
+        }
+        self.0.receive(ctx, input);
+    }
+
+    fn crashed(&self) -> bool {
+        self.0.crashed()
+    }
+
+    fn set_crashed(&mut self, crashed: bool) {
+        self.0.set_crashed(crashed);
+    }
+}

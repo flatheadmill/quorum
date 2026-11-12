@@ -40,7 +40,7 @@ audit_directory = os.environ.get('QUORUM_ACCOUNT_AUDIT_EVIDENCE')
 audit = Path(audit_directory).resolve() if audit_directory else None
 binary = Path('target/debug/quorum').resolve()
 level_hash = 'd8886526fbaa53326c66a9b282a78f7b71de63d4f877bea3de65ebefaf0866d3'
-base = '3bc7596b7c778f6574a45e7159cadf157c4be3b3'
+base = '97c7ad0315f5bb7dcb06ebb29a7d05e9ac347bfe'
 sha = lambda data: hashlib.sha256(data).hexdigest()
 
 def value_equal(left, right):
@@ -81,11 +81,18 @@ if review is not None:
         review_manifest.append((digest, name))
     (root/'review-inputs.sha256').write_text(''.join(f'{digest}  {name}\n' for digest, name in review_manifest))
 audit_manifest = []
+audit_manifests = {}
 if audit is not None:
-    for line in (audit/'SHA256SUMS').read_text().splitlines():
-        digest, name = line.split('  ', 1)
-        assert sha((audit/name).read_bytes()) == digest, f'Audit evidence changed: {name}'
-        audit_manifest.append((digest, name))
+    for filename in ('SHA256SUMS', 'SHA256SUMS.postaccept', 'SHA256SUMS.timing'):
+        path = audit/filename
+        if filename != 'SHA256SUMS' and not path.exists():
+            continue
+        data = path.read_bytes()
+        audit_manifests[filename] = sha(data)
+        for line in data.decode().splitlines():
+            digest, name = line.split('  ', 1)
+            assert sha((audit/name).read_bytes()) == digest, f'Audit evidence changed: {name}'
+            audit_manifest.append((digest, name))
     (root/'audit-inputs.sha256').write_text(''.join(f'{digest}  {name}\n' for digest, name in audit_manifest))
 
 line_keys = {'line', 'first_line', 'boundary_line', 'desire_line', 'close_line', 'attempt_line',
@@ -295,6 +302,80 @@ if audit is not None:
         'signed_zero_identity':{'control_choice':zero_control['choices'][0],
             'signed_choice':zero_signed['choices'][0],'exact_choice':zero_signed['attempts'][0]['exact_choice']},
     })
+    if 'SHA256SUMS.postaccept' in audit_manifests:
+        timing = {}
+        for name, expected_hash in (
+            ('early', '078a0e8b2cac569cb27a14141c6ea592d4106a3539053b61d3022918af733d79'),
+            ('control', '6bc492796296e242b46416339952ee7596dc8b542c90eff54d73ced11df63b0a'),
+        ):
+            r = reports[f'audit/tapes3/{name}.jsonl']
+            assert r['source_sha256']==expected_hash
+            assert not any(p['verdict']=='violated' for p in r['obligations']), r['obligations']
+            rows = [json.loads(line) for line in (audit/f'tapes3/{name}.jsonl').read_bytes().splitlines()]
+            proposal, output = next((line,row) for line,row in enumerate(rows,1)
+                if row['what']=='desire' and row['why']=='send' and row['node']==0
+                and row['message']=={'type':'accept','ballot':[2,0],'slot':0,'value':'x'})
+            issued = next(line for line,row in enumerate(rows,1)
+                if row['what']=='close' and row['input_id']==output['parent_input_id'])
+            replies = [line for line,row in enumerate(rows,1)
+                if row['what']=='dispatch' and row['why']=='message' and row['to']==0
+                and row['message']=={'type':'accepted','ballot':[2,0],'slot':0,'value':'x'}]
+            early = [line for line in replies if line < issued]
+            genuine = [line for line in replies if line > issued]
+            assert len(genuine)==2 and early==([44] if name=='early' else [])
+            receivers = [p for p in r['obligations'] if p['proposition']=='receiver_conformance']
+            assert all(p['verdict']=='established' for p in receivers), receivers
+            for reply in genuine:
+                p = next(p for p in receivers if p['subject']['input_line']==reply)
+                assert {proposal,issued,reply} <= set(p['support']), p
+                assert not set(early).intersection(p['support']), p
+            if name=='early':
+                assert (proposal,issued,genuine)==(81,84,[125,152])
+                assert {126,155,156} <= {p['boundary_line'] for p in receivers}
+            assert not r['choices']
+            assert [c['kind'] for c in r['claims']]==['commit','chosen']
+            for claim in r['claims']:
+                assert claim['local_basis']['verdict']=='established'
+                assert claim['transitive_support']['verdict']=='indeterminate'
+                assert set(early) <= set(claim['local_basis']['support'])
+            timing[name] = {'source_sha256':r['source_sha256'],'proposal_desire_line':proposal,
+                'proposal_close_line':issued,'early_dispatch_lines':early,'counted_dispatch_lines':genuine,
+                'receivers':receivers,'claims':r['claims']}
+        save_json(root/'postaccept-judgments.json', timing)
+    if 'SHA256SUMS.timing' in audit_manifests:
+        timing_controls = {}
+        expected_boundaries = {
+            'prequorum': [51,54],
+            'again': [45,126,155,156,171],
+            'sametick_before': [78,126,155,156,171],
+            'sametick_after': [90,128,129,144],
+            'delayed': [118,147,148,163],
+            'unread_pre': [126,155,156,171],
+            'unread_post': [144,173,174,189],
+        }
+        for name, boundaries in expected_boundaries.items():
+            r = reports[f'audit/tapes4/{name}.jsonl']
+            receivers = [p for p in r['obligations'] if p['proposition']=='receiver_conformance']
+            assert [p['boundary_line'] for p in receivers]==boundaries, (name,receivers)
+            for p in receivers:
+                uncertain = name=='unread_post' and p['boundary_line']==144
+                assert p['verdict']==('indeterminate' if uncertain else 'established'), (name,p)
+                assert p['gaps']==(['send:8'] if uncertain else []), (name,p)
+            timing_controls[name] = {'source_sha256':r['source_sha256'],
+                'receivers':receivers,'claims':r['claims']}
+        r = reports['audit/tapes4/unread_client_post.jsonl']
+        assert r['source_sha256']=='d1437101bf8a13e7a34a9a8e320c42701a3ed040f789d04ca72dfd69be704c4b'
+        assert any(f['id']=='client:31' for f in r['interpretation_findings'])
+        receivers = [p for p in r['obligations'] if p['proposition']=='receiver_conformance']
+        assert any(p['boundary_line']==138 for p in receivers)
+        assert all(p['verdict']=='established' and not p['gaps'] for p in receivers), receivers
+        assert not r['choices']
+        assert [c['kind'] for c in r['claims']]==['commit','chosen']
+        assert all(c['local_basis']['verdict']=='established'
+            and c['transitive_support']['verdict']=='indeterminate' for c in r['claims'])
+        timing_controls['unread_client_post'] = {'source_sha256':r['source_sha256'],
+            'receivers':receivers,'claims':r['claims'],'interpretation_findings':r['interpretation_findings']}
+        save_json(root/'timing-judgments.json', timing_controls)
 
 calm = reports['calm-accepted/calm.a.jsonl']
 cut = reports['calm-accepted/calm.chosen-before-known.jsonl']
@@ -363,6 +444,7 @@ save_json(root/'manifest.json', {'base_revision':head,'git_status_porcelain':sta
     'review_tapes':sum(case['source'].startswith('review/') for case in catalog),
     'audit_root':str(audit) if audit is not None else None,'verified_audit_files':len(audit_manifest),
     'audit_tapes':sum(case['source'].startswith('audit/') for case in catalog),
+    'audit_manifests_sha256':audit_manifests,
     'account_version':calm['account_version'],'schema_version':calm['schema_version'],
     'rustc':command('rustc','--version').decode().strip(),'cargo':command('cargo','--version').decode().strip(),
     'reproduce':'[QUORUM_ACCOUNT_REVIEW_EVIDENCE=review-directory] [QUORUM_ACCOUNT_AUDIT_EVIDENCE=audit-directory] bash scripts/check-paxos-account.sh <retained-evidence-directory> <interpretation-file>',
@@ -374,6 +456,10 @@ if review is not None:
     print(f'Review evidence: {len(review_manifest)} original files unchanged; three repaired review scenarios checked')
 if audit is not None:
     print(f'Audit evidence: {len(audit_manifest)} original files unchanged; learned-slot, header-mismatch, signed-zero pair and five fixed honest samples checked')
+    if 'SHA256SUMS.postaccept' in audit_manifests:
+        print('Post-acceptance evidence: early/control pair checked; receiver timing excludes early replies without filtering knowledge')
+    if 'SHA256SUMS.timing' in audit_manifests:
+        print('Timing evidence: seven immutable boundary controls preserved; malformed client excluded from receiver gaps')
 print(f'Fixed source base: {head}; source manifest SHA-256 {sha(manifest.encode())}')
 print(json.dumps(summary,indent=2))
 PY_ACCOUNT

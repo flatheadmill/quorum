@@ -103,9 +103,14 @@ fn response(
                 }
                 return result;
             }
+            let proposal = proposal.unwrap();
+            let issued = proposal.close_line.unwrap();
+            // Earlier testimony remains knowledge evidence, but the receiver
+            // could not count it toward a proposal that had not been issued.
             let mut members = BTreeSet::new();
             for (receipt, input) in &e.projection.inputs {
-                if input.to() != node || e.projection.input_lines[receipt] > line {
+                let receipt_line = e.projection.input_lines[receipt];
+                if input.to() != node || receipt_line <= issued || receipt_line > line {
                     continue;
                 }
                 if let Input::Message { envelope, .. } = input
@@ -113,17 +118,34 @@ fn response(
                     && matches!(e.input_messages.get(receipt),Some(Ok(Message::Accepted{ballot:b,slot:s,value:v})) if b==ballot && s==slot && v==value)
                     && members.insert(envelope.from)
                 {
-                    result.support.push(e.projection.input_lines[receipt]);
+                    result.support.push(receipt_line);
                 }
             }
             if members.len() < config.acceptors.len() / 2 + 1 {
-                result.gaps.extend(e.input_gap_ids(node, line));
+                result.gaps.extend(
+                    e.projection
+                        .inputs
+                        .iter()
+                        .filter(|(id, input)| {
+                            matches!(input, Input::Message { .. })
+                                && input.to() == node
+                                && e.projection.input_lines[id] > issued
+                                && e.projection.input_lines[id] < line
+                                && e.input_messages.get(id).is_some_and(Result::is_err)
+                        })
+                        .map(|(id, _)| e.finding_id_for_input(*id))
+                        .filter(|id| {
+                            e.findings
+                                .iter()
+                                .any(|finding| finding["id"].as_str() == Some(id.as_str()))
+                        }),
+                );
                 if result.gaps.is_empty() {
                     result.expected = Some(vec![]);
                 }
                 return result;
             }
-            result.completed_proposal = Some(proposal.unwrap().id);
+            result.completed_proposal = Some(proposal.id);
             (*ballot, *slot, value, true)
         }
         _ => {
