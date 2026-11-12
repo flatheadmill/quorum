@@ -1,5 +1,5 @@
 use quorum::{
-    Result,
+    Result, paxos_account,
     projection::{Projection, Tape},
     replay::{self, Mode},
     scenarios, vote,
@@ -25,6 +25,21 @@ fn run() -> Result<()> {
             let output = fs::File::create(&args[2]).map_err(|e| e.to_string())?;
             let sim = scenarios::capture(&args[1], Box::new(output))?;
             println!("{}", sim.check_projection()?.summary());
+        }
+        "paxos-account" => {
+            if !(args.len() == 2 || (args.len() == 3 && args[2] == "--json")) {
+                return Err("usage: quorum paxos-account <tape.jsonl> [--json]".into());
+            }
+            let bytes = fs::read(&args[1]).map_err(|e| e.to_string())?;
+            let report = paxos_account::examine(&bytes);
+            if args.len() == 3 {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", paxos_account::human(&report));
+            }
         }
         "inspect" | "replay" | "diagnose" | "vote" | "prefixes" => {
             if args.len() != 2 {
@@ -63,7 +78,7 @@ fn run() -> Result<()> {
         }
         _ => {
             return Err(
-                "usage: quorum [raft|ping-pong|calm|capture|inspect|replay|diagnose|vote|prefixes]"
+                "usage: quorum [raft|ping-pong|calm|capture|inspect|replay|diagnose|vote|prefixes|paxos-account]"
                     .into(),
             );
         }

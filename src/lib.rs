@@ -1,6 +1,7 @@
 //! Quorum — deterministic bench for consensus inhabitants.
 
 pub mod multi_paxos;
+pub mod paxos_account;
 pub mod ping_pong;
 pub mod projection;
 pub mod raft;

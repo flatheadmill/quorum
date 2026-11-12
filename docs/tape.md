@@ -42,9 +42,11 @@ cargo run --locked -- vote target/raft.jsonl
 
 `quorum raft`, `quorum ping-pong`, and `quorum calm` also stream directly to stdout. `capture`
 writes its tape path and prints the final projection summary on stdout.
-`inspect`, `prefixes`, `replay`, and `vote` consume the file without modifying it.
-Errors go to stderr with a failing exit status. Reports hash the original bytes
-and cite one-based JSONL line numbers; the row sequence itself is zero-based.
+`inspect`, `prefixes`, `replay`, `vote`, and `paxos-account` consume the file
+without modifying it. Usage and file I/O errors fail on stderr. The independent
+account instead returns protocol findings and world-reader errors inside its
+report, with exit status zero. Reports hash original bytes and cite one-based
+JSONL lines; the row sequence itself is zero-based.
 The CLI's `capture` output path is explicitly overwritten if it exists.
 
 Run `bash scripts/check-slice2.sh` for the reproducible evidence set under
@@ -130,8 +132,8 @@ preceding closed portion, not the panicking input.
 
 The fixtures establish receiver behavior, not globally legal Paxos histories.
 The choice cut is the declared workload's hand-worked protocol interpretation.
-Neither these observations nor strict replay is the independent Certificate
-Verifier; that verifier and Duel remain outside Calm.
+Neither those observations nor strict replay substitutes for the independent
+`paxos-account` below. It can judge the retained bytes without regenerating them.
 
 ## Schema 1
 
@@ -284,10 +286,218 @@ The last query is the minimal node-view check: all local dispatches and attempts
 retain their original causal identities. It is not a standalone node-tape export
 format or a distributed merger.
 
+## Independent Multi-Paxos account
+
+```sh
+cargo run --locked -- paxos-account target/calm.jsonl
+cargo run --locked -- paxos-account target/calm.jsonl --json
+bash scripts/check-paxos-account.sh retained-evidence/ 003_multi_paxos.md
+```
+
+`quorum::paxos_account::examine(&[u8]) -> serde_json::Value` and
+`human(&Value) -> String` expose the same report as the CLI. The account shares
+world validation and identity vocabulary, not Multi-Paxos Config/message/record
+parsers, inhabitant state, or replay decisions. Its fixed interpretation is
+`003_multi_paxos.md`, SHA-256
+`d8886526fbaa53326c66a9b282a78f7b71de63d4f877bea3de65ebefaf0866d3`.
+It is a bounded account of observed evidence, not a proof of an implementation's
+general correctness or future progress.
+
+### Report schema 1
+
+The top-level keys are `schema_version`, `account_version`, `interpretation`,
+`source_sha256`, `world`, `coverage`, `interpretation_findings`, `choices`,
+`obligations`, `claims`, `attempts`, `observations`, and
+`interpretation_gap_dependencies`. Arrays and identities are deterministic.
+There is deliberately no overall pass/fail field.
+
+Certificates, proposal attempts and client/fresh counts use the world's
+`serde_json::Value` equality, not serialized JSON text. Floating `0.0` and
+`-0.0` are equal, including inside arrays/objects; integer `0` and floating
+`0.0` remain distinct. Reports preserve the first observed representative
+without normalizing its rendering. Choice and attempt order follows their
+first quorum/desire boundaries, independently of hash-map iteration.
+An attempt's first spelling labels its report ID, never its semantic lookup.
+
+| Peer section | Stable meaning and fields |
+| --- | --- |
+| `choices` | Historical exact `(slot, ballot, value)` header-majority certificates: `id`, `quorum`, immutable `first_quorum_line`/`first_support`, and accumulating per-acceptor `witnesses`. Illegal authority, watermark or adoption never filters an observable fulfilled acceptance. |
+| `obligations` | Separate configuration, agreement, validity, workload and evidence propositions. Each has `id`, `proposition`, `category`, `subject`, `boundary_line`, `verdict`, `support`, `counterevidence`, `gaps`, and `reason`. |
+| `claims` | Every Commit assertion and each scoped Chosen output: `id`, `kind`, `node`, `slot`, `ballot`, `value`, `assertion`, `effect`, `local_basis`, `transitive_support`, `choice_at_boundary`, `choices_seen_later`, `ballot_paths`, and `unsupported_by_tape`. |
+| `attempts` | Each authoritative proposer/slot/ballot/value assertion, even without a claim: `id`, `proposer`, `slot`, `ballot`, `value`, `first_relevant_line`, `origin`, `sends`, `replies`, `other_replies`, `exact_choice`, `same_value_elsewhere`, `slot_witnessed_values`, `world_work`, `resolution`, and `obligation_ids`. |
+
+The only proposition verdicts are `established`, `violated`, `pending`, and
+`indeterminate`. Pending requires an explicitly open world operation.
+Unsupported testimony is an ordinary reason for a violated or indeterminate
+evidence proposition, not a fifth verdict. Undeclared script actors do not
+receive sender-contract verdicts; their visible assertions and inconsistencies
+remain reportable. Their complete positive evidence chains can still establish
+knowledge, while undeclared initial knowledge prevents absence-based negatives.
+
+Unavailable premises are located, not inferred from an `indeterminate` label.
+Parse uncertainty cites actual finding IDs in `gaps` and the dependency table.
+Non-parse uncertainty uses `unavailable_premises`: entries name the `premise`,
+its `support`, `counterevidence` and real `gaps`, with `nodes` when a declaration
+or initial state is unavailable. Contradictory first-quorum reports appear in
+outer `counterevidence` as well as the unavailable map dependency. Later
+cumulative-count uncertainty retains the original conflict/gap and allocation
+boundaries, even if a later campaign has a determined map. Reasons identify
+the unavailable premise rather than merely restating the successful invariant.
+
+`coverage.nodes` names each declaration, its `covered`/`malformed`/`undeclared`
+contract, parsed Config when available, initial-state coverage, and header
+acceptor status. The header acceptor set alone defines global certificates;
+covered proposer rules use their own declared acceptor set. Well-formed set or
+suffix disagreement is a configuration violation, not an interpretation gap.
+Per-node activation and initial-round differences are legal.
+
+`world` contains `valid_rows`, `total_rows`, `valid_prefix_bytes`, `tail`,
+the unchanged world `account`, `stopped`, and `error`. A malformed world row
+sets `error: {line, reason}` and retains the last valid world prefix; it does not
+change `Tape::read` or fabricate suffix identities. `source_sha256` still hashes
+the complete original input, including the bad suffix. Protocol shape faults
+instead leave the world prefix intact and allow later readable facts to count.
+
+### Boundaries, origins, and evidence
+
+Claim `assertion` records `desire_id`, `input_id`, `desire_line`, answer
+`position`, and `close_line`. `effect` records `attempt_line`, `result_line`,
+`outcome`, and `status`. Admission is the attempt: unreached assertions have
+null knowledge propositions and no invented choice-comparison boundary.
+An admitted but refused Commit retains its knowledge judgments. A later
+desire stranded behind a refusal has state `unreached/refused`, not pending,
+even if finalization preserves it in the world's terminal account.
+
+Commit's `ballot` remains null. `ballot_paths` keeps separate exact-ballot
+Accepted quorums and Chosen paths, including failed alternatives. Recursive
+Chosen paths reference `knowledge_evidence` observations at the sender's
+earlier Send admission. Accepted support requires a matching fulfilled Save
+before that reply's Send admission; a later Save cannot repair an earlier
+claim. One complete alternative establishes support without erasing failed
+alternatives. Eligibility and conformance stay adjacent, never proof filters.
+
+Learning a slot/value and announcing a completed proposal are separate
+transitions. A learner that later completes its own proposal for that value
+suppresses the duplicate Commit but still broadcasts Chosen to its configured
+learners. Further Accepted replies for that exact completed proposal do not
+repeat the broadcast. Receiver conformance remains separate from each claim's
+header-based local and transitive evidence.
+
+Attempt `origin.kind` is `adopted`, `fresh`, or `undetermined`.
+`allocation_line` is the close containing the first Accept desire; its
+`first_desire_line` and `first_desire_position` preserve within-answer order.
+An unclosed allocation consumes nothing. Repeated broadcasts share one
+proposal; refusal does not undo a closed allocation. Only the same slot/value
+in a determined immutable first-quorum map receives adoption credit.
+The first encounter counts distinct individually valid Promise senders even
+when their reports contradict. Such a quorum can establish the Phase-2 gate
+without determining an adoption map; later consistent subsets cannot replace
+it or restore map-dependent adoption, FIFO or drain credit.
+
+An adopted origin also exposes `acceptance_ancestry`: each relevant entry in
+that frozen quorum joins its original Promise dispatch to the source Send
+admission and exact earlier fulfilled acceptance Saves at that acceptor.
+`selection` proves adoption separately from these `paths`; lower-ballot
+competing entries and failed history joins remain explicit. A later Promise
+or Save cannot repair the original basis. An undeclared script's positive
+Save chain can establish ancestry without an initial-state contract. Missing
+ancestry never revokes observed adoption or consumes a client allowance,
+and prior choice is not required for adoption.
+
+For allocated non-adopted origins, `client_count` exposes `available`,
+`allocated`, and `certain`. Counts are per proposer and exact JSON value.
+When uncertain, counts are observed lower bounds, not granted allowance.
+Adopted and unclosed origins have null `client_count`. A client-only parse gap
+can make counts/FIFO uncertain without making a known fresh origin unknown.
+An undetermined first quorum/map makes origin undetermined; from that closed
+allocation, consumption of every later value remains uncertain with no
+within-campaign restoration. A known missing quorum instead yields fresh
+origin and violates the Phase-2 gate and adoption's required quorum premise;
+it is not an unavailable map and earns no adoption credit. An earlier closed
+unreadable Send can instead hide a Prepare: missing-campaign/map conclusions
+then remain uncertain with that finding's ID. Known campaigns, frozen maps
+and independently witnessed activation failures remain intact.
+
+Every header acceptor appears in `replies`, including no-reply observations.
+Mismatching/duplicate replies and other senders or recipients remain explicit.
+A Nack joins an attempt only through its actual Accept request ancestry;
+Prepare ancestry is campaign testimony, and a script trigger stays unattributed.
+Misdirected Nacks do not become replies received by the proposer.
+`exact_choice` names only the exact tuple, `same_value_elsewhere` names other
+ballots with the same slot/value, and `slot_witnessed_values` contains only
+certificates for different values at that slot.
+`resolution.exact_choice` and `resolution.world_open` are independent; its
+display `state` prefers `exact_choice`, then `world_open`, then `unresolved`.
+An empty world without a certificate is unresolved intent, not pending work,
+client completion, or permanent defeat.
+
+For each pair of conflicting certificates, `conflict_explanation` checks the
+account itself at the second certificate's first-quorum boundary. It traces
+the first supporting Saves, their request/Promise ancestry and relevant
+durable history. A causally relevant agreement/validity failure or an actual
+participant's header-acceptor-universe mismatch explains the conflict; a
+failure on another slot, unrelated actor/operation or later boundary does not.
+Pairwise-only configuration differences are not a substitute for this causal
+join. Header certificates and conflicting-choice violations remain visible
+even when a declared-universe mismatch explains them. If the history is fully
+covered but no explaining predicate failed, `unexplained_conflicting_choices`
+reports a missing or overgenerous account rule, not protocol tolerance.
+Unavailable relevant configuration/history leaves this self-check
+indeterminate with located dependencies, without hiding either choice or
+weakening claimant evidence under the header universe.
+
+### Interpretation gaps and reproducible evidence
+
+Each interpretation finding has a causal `id`, `kind`, `node`, `first_line`,
+all `occurrence_lines`, `world_identity`, `failed_shape`, `reason`, and
+`affected_premises`. Scope follows declarations and world boundaries, not JSON
+resemblance. Copies of one logical item share one finding; identical unrelated
+items do not. Malformed Config does not remove its actor from parsing scope.
+
+`interpretation_gap_dependencies` is the reviewable dependency table. Every
+row names `finding_class`, `first_boundary`, `identity`, `affected_premises`,
+`affected_propositions`, forward `propagation`, required `restoration`, and
+the `report_fields` exposing those limits. Its six classes are configuration,
+client input, peer input, output Send, output Save, and fulfilled Save.
+An unfulfilled unreadable Save does not alter durable state. A later explicit
+watermark can identify current state without repairing unknown history.
+A later matching acceptance can support a later reply, not an earlier one.
+`no_conflicting_choices` needs readable fulfilled-save and initial-state
+coverage; two readable conflicting certificates still establish violation.
+
+`check-paxos-account.sh` requires a retained-evidence directory and the exact
+interpretation file named by the report. It replaces only generated account
+evidence plus the existing Calm/Slice-2 generated directories.
+The original retained tapes and checksums are read-only inputs, never recaptured.
+`QUORUM_ACCOUNT_REVIEW_EVIDENCE` optionally supplies a checksummed review
+directory containing the inactive-campaign pair and continued-contradiction
+probe; the command preserves those inputs and verifies their repaired
+judgments alongside the self-contained regressions.
+`QUORUM_ACCOUNT_AUDIT_EVIDENCE` optionally supplies the fixed audit bundle.
+Its checksummed learned-then-own-quorum, header-mismatch, signed-zero control
+pair and five honest-history samples are read-only inputs. Certificate joins
+use the same value equality rather than textual number spelling.
+The command also requires every indeterminate obligation to carry a real gap
+or located unavailable dependency.
+The command runs the existing regression checks and independent counterexamples,
+judges every retained receiver tape and adoption probe, checks deterministic
+JSON/human output and original one-based citations, and writes:
+
+- Per-input `.report.json` and `.human.txt` reports.
+- `judgments.json`, with all retained/counterexample outcomes and cited findings.
+- `retained-judgments.json`, covering Calm, the chosen-before-known cut,
+  unsupported owner, and real adoption history.
+- `review-judgments.json` and `review-inputs.sha256` when review inputs are supplied.
+- `audit-judgments.json` and `audit-inputs.sha256` when audit inputs are supplied.
+- `interpretation-gap-dependencies.json`.
+- `manifest.json`, `source-manifest.sha256`, and `retained-inputs.sha256`,
+  fixing the source base/status, interpretation and original evidence identities.
+- `validation.txt` and `SHA256SUMS`, including the finished validation transcript.
+
 ## Boundary
 
-No Certificate Verifier, Duel, honest recovery, socket adapter, physical WAL,
-distributed merger, timeout-policy redesign, or Apply witness is included.
+No Duel, honest recovery, socket adapter, physical WAL, distributed merger,
+timeout-policy redesign, or Apply witness is included.
 `recover` preserves the old flag-flip behavior and explicitly labels it
 `retained_state`; its tape is not evidence of correct restart behavior. Future
 recovery must rebuild only from fulfilled Save records and discard volatile
