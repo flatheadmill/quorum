@@ -142,11 +142,16 @@ Neither those observations nor strict replay substitutes for the independent
 cargo run --locked -- capture duel-inclusion target/duel-inclusion.jsonl
 cargo run --locked -- capture duel-exclusion target/duel-exclusion.jsonl
 cargo run --locked -- paxos-account target/duel-inclusion.jsonl --json
-bash scripts/check-duel.sh "$RETAINED_EVIDENCE" "$DUEL_LEVEL"
+bash scripts/check-duel.sh \
+  "$RETAINED_EVIDENCE" \
+  "$RETAINED_EVIDENCE/../duel-commission-e5a1518f.md"
 ```
 
 The validation command requires the retained Multi-Paxos evidence root and the
-exact commissioned Duel level file. It writes new artifacts under
+exact commissioned Duel level file. The immutable second input is retained at
+Athenaeum-relative path `projects/quorum/stacks/duel-commission-e5a1518f.md`,
+SHA-256 `e5a1518ff5f24b01dabe46520cf326256a75c0aeaafd6a38212a34e54f6d78fa`;
+the adjacent `.sha256` sidecar verifies its bytes. It writes new artifacts under
 `target/duel-evidence/`; it never refreshes the retained answer-key inputs.
 
 Duel uses the unchanged inhabitants at nodes 0, 1 and 2, all acceptors and

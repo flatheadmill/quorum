@@ -705,8 +705,7 @@ impl Node for FaultyAnswer {
     }
 }
 
-#[test]
-fn declared_faulty_answer_is_fresh_once_but_violates_adoption_fifo_and_drain() {
+fn faulty_control() -> Simulator {
     let mut header = scenarios::header("duel-inclusion").unwrap();
     header.scenario = "duel-declared-faulty-answer-control".into();
     let specs = header.nodes.clone();
@@ -728,6 +727,12 @@ fn declared_faulty_answer_is_fresh_once_but_violates_adoption_fifo_and_drain() {
     sim.client_message(NodeId(1), multi_paxos::propose(json!("y")))
         .unwrap();
     assert!(sim.run(28).unwrap());
+    sim
+}
+
+#[test]
+fn declared_faulty_answer_is_fresh_once_but_violates_adoption_fifo_and_drain() {
+    let sim = faulty_control();
     let all = report(sim.rows());
     let first_choice = &array(&all, "choices")[0];
     assert_eq!(first_choice["first_quorum_line"], 221);
@@ -855,4 +860,196 @@ fn declared_faulty_answer_is_fresh_once_but_violates_adoption_fifo_and_drain() {
         bytes,
     )
     .unwrap();
+}
+
+// Derive the fixed histories' report/acceptance/answer relation directly from
+// tape rows, without account judgments or pinned lines.
+struct FrozenDecision {
+    members: BTreeMap<i64, (usize, Value)>,
+    freeze_dispatch: usize,
+    close: usize,
+    answer: Vec<(u64, Value)>,
+    old: Vec<(i64, usize)>,
+}
+
+fn line(row: &Event) -> usize {
+    row.seq as usize + 1
+}
+
+fn carries(row: &Event, what: &str, kind: &str) -> bool {
+    let why = if what == "dispatch" {
+        "message"
+    } else {
+        "send"
+    };
+    row.what == what && row.why == why && row.fields["message"]["type"] == kind
+}
+
+fn accepted_save(row: &Event) -> bool {
+    row.what == "result"
+        && row.why == "save"
+        && row.fields["outcome"] == "fulfilled"
+        && row.fields["record"]["record"] == "accepted"
+}
+
+fn promise_admission(rows: &[Event], acceptor: i64) -> usize {
+    rows.iter()
+        .find(|row| {
+            carries(row, "attempt", "promise")
+                && row.fields["node"] == acceptor
+                && row.fields["to"] == 1
+        })
+        .map(line)
+        .unwrap()
+}
+
+fn frozen_decision(rows: &[Event]) -> FrozenDecision {
+    let header = &rows[0].fields;
+    let quorum = header["acceptors"].as_array().unwrap().len() / 2 + 1;
+    let ballot = |node: usize| json!([header["nodes"][node]["config"]["initial_round"], node]);
+    let (lower, higher) = (ballot(0), ballot(1));
+    let mut members = BTreeMap::new();
+    let mut freeze = None;
+    for row in rows {
+        if freeze.is_none()
+            && carries(row, "dispatch", "promise")
+            && row.fields["to"] == 1
+            && row.fields["message"]["ballot"] == higher
+        {
+            let report = row.fields["message"]["accepted"].clone();
+            // This honest workload has one valid matching Promise per sender.
+            members
+                .entry(row.fields["from"].as_i64().unwrap())
+                .or_insert((line(row), report));
+            if members.len() == quorum {
+                freeze = Some(row);
+            }
+        }
+    }
+    let freeze = freeze.expect("B freezes a first Promise quorum");
+    let input = &freeze.fields["input_id"];
+    let close = rows
+        .iter()
+        .find(|row| row.what == "close" && row.fields["input_id"] == *input)
+        .map(line)
+        .unwrap();
+    let mut answer = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| carries(row, "desire", "accept") && row.fields["parent_input_id"] == *input)
+    {
+        let message = &row.fields["message"];
+        let proposal = (message["slot"].as_u64().unwrap(), message["value"].clone());
+        if !answer.contains(&proposal) {
+            answer.push(proposal);
+        }
+    }
+    let old = rows[..close]
+        .iter()
+        .filter(|row| accepted_save(row) && row.fields["record"]["ballot"] == lower)
+        .map(|row| (row.fields["node"].as_i64().unwrap(), line(row)))
+        .collect();
+    FrozenDecision {
+        members,
+        freeze_dispatch: line(freeze),
+        close,
+        answer,
+        old,
+    }
+}
+
+#[test]
+fn one_quorum_membership_decides_by_whether_the_old_acceptance_is_inside_it() {
+    let old_x = json!([{"slot":0,"ballot":[1,0],"value":"x"}]);
+    let mut memberships = Vec::new();
+    for duel in [INCLUSION, EXCLUSION] {
+        let sim = capture(duel);
+        let rows = sim.rows();
+        let decision = frozen_decision(rows);
+        // The sole fulfilled acceptance before the close is the old one.
+        assert_eq!(decision.old.len(), 1);
+        let (holder, save) = decision.old[0];
+        assert_eq!(
+            rows[..decision.close]
+                .iter()
+                .filter(|row| accepted_save(row))
+                .count(),
+            1
+        );
+        // Each frozen report tells the truth about its acceptor's history at
+        // the moment that Promise was admitted.
+        for (&member, (dispatch, reported)) in &decision.members {
+            assert!(*dispatch <= decision.freeze_dispatch);
+            let held = member == holder && save < promise_admission(rows, member);
+            assert_eq!(*reported, if held { old_x.clone() } else { json!([]) });
+        }
+        let inside = decision.members.contains_key(&holder);
+        assert_eq!(inside, duel.seed == 331);
+        assert_eq!(
+            decision.answer,
+            if inside {
+                vec![(0, json!("x")), (1, json!("y"))]
+            } else {
+                vec![(0, json!("y"))]
+            }
+        );
+        if !inside {
+            // The excluded acceptance is B's own: real, already durable when
+            // B promised itself, and reported only after the decision closed.
+            assert_eq!(holder, 1);
+            assert!(save < promise_admission(rows, holder));
+            let own = rows
+                .iter()
+                .find(|row| {
+                    carries(row, "dispatch", "promise")
+                        && row.fields["to"] == 1
+                        && row.fields["from"] == holder
+                })
+                .unwrap();
+            assert!(line(own) > decision.close);
+            assert_eq!(own.fields["message"]["accepted"], old_x);
+        }
+        memberships.push(decision.members.keys().copied().collect::<Vec<_>>());
+    }
+    // The same two acceptors decide in both histories.
+    assert_eq!(memberships, [vec![0, 2], vec![0, 2]]);
+}
+
+#[test]
+fn declared_wrapper_leaves_the_honest_history_untouched_until_one_answer() {
+    let honest = capture(INCLUSION);
+    let control = faulty_control();
+    let (honest, control) = (honest.rows(), control.rows());
+    let decision = frozen_decision(honest);
+    // Row 0 is the header, which differs in scenario name by declaration.
+    let first = (1..honest.len().min(control.len()))
+        .find(|&row| honest[row] != control[row])
+        .unwrap();
+    // Every row through B's quorum-completing dispatch is identical; the
+    // first difference is the first desire of that one answer.
+    assert_eq!(first, decision.freeze_dispatch);
+    let input = &honest[first - 1].fields["input_id"];
+    let answer = |rows: &[Event]| {
+        rows.iter()
+            .filter(|row| row.what == "desire" && row.fields["parent_input_id"] == *input)
+            .map(|row| (row.fields["to"].clone(), row.fields["message"].clone()))
+            .collect::<Vec<_>>()
+    };
+    let (honest_answer, control_answer) = (answer(honest), answer(control));
+    assert_eq!(honest_answer.len(), 6);
+    assert_eq!(control_answer.len(), 3);
+    for ((to, wrong), (honest_to, right)) in control_answer.iter().zip(&honest_answer) {
+        assert_eq!(to, honest_to);
+        assert_eq!(right["slot"], 0);
+        assert_eq!(right["value"], "x");
+        let mut expected = right.clone();
+        expected["value"] = json!("y");
+        assert_eq!(*wrong, expected);
+    }
+    // What the wrapper withheld is exactly the honest slot-1 broadcast of y.
+    assert!(
+        honest_answer[3..]
+            .iter()
+            .all(|(_, message)| message["slot"] == 1 && message["value"] == "y")
+    );
 }
