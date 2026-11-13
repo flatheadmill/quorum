@@ -66,7 +66,6 @@ def save_json(path, value):
 
 assert sha(level.read_bytes()) == level_hash, 'The commissioned interpretation changed'
 head = command('git', 'rev-parse', 'HEAD').decode().strip()
-assert head == base, f'Expected fixed base {base}, found {head}'
 retained_manifest = []
 for line in (retained/'SHA256SUMS').read_text().splitlines():
     digest, name = line.split('  ', 1)
@@ -436,7 +435,7 @@ source_files = sorted({Path('Cargo.toml'),Path('Cargo.lock'),Path('build.rs'),Pa
 manifest = ''.join(f'{sha(path.read_bytes())}  {path}\n' for path in source_files)
 (root/'source-manifest.sha256').write_text(manifest)
 status = command('git','status','--porcelain=v1','--untracked-files=all').decode()
-save_json(root/'manifest.json', {'base_revision':head,'git_status_porcelain':status,
+save_json(root/'manifest.json', {'base_revision':base,'validated_revision':head,'git_status_porcelain':status,
     'source_files':[str(path) for path in source_files],'source_manifest_sha256':sha(manifest.encode()),
     'interpretation':str(level),'interpretation_sha256':level_hash,'retained_root':str(retained),
     'retained_manifest_sha256':sha((retained/'SHA256SUMS').read_bytes()),'verified_retained_files':len(retained_manifest),
@@ -460,6 +459,6 @@ if audit is not None:
         print('Post-acceptance evidence: early/control pair checked; receiver timing excludes early replies without filtering knowledge')
     if 'SHA256SUMS.timing' in audit_manifests:
         print('Timing evidence: seven immutable boundary controls preserved; malformed client excluded from receiver gaps')
-print(f'Fixed source base: {head}; source manifest SHA-256 {sha(manifest.encode())}')
+print(f'Accepted account base: {base}; validated revision: {head}; source manifest SHA-256 {sha(manifest.encode())}')
 print(json.dumps(summary,indent=2))
 PY_ACCOUNT

@@ -116,13 +116,47 @@ pub fn header(scenario: &str) -> Result<Header> {
                 membership,
             )
         }
+        "duel-inclusion" | "duel-exclusion" => {
+            let membership = vec![NodeId(0), NodeId(1), NodeId(2)];
+            let nodes = membership
+                .iter()
+                .map(|&node| NodeSpec {
+                    node,
+                    algorithm: "multi-paxos".into(),
+                    config: json!({
+                        "acceptors": membership,
+                        "learners": membership,
+                        "proposers": [0, 1],
+                        "active_proposer": if node.0 < 2 { Some(node) } else { None },
+                        "from_slot": 0,
+                        "initial_round": if node == NodeId(1) { 2 } else { 1 },
+                        "initial_state": "empty",
+                    }),
+                })
+                .collect();
+            (
+                WorldConfig {
+                    base_latency: 1,
+                    jitter: 3,
+                    tick_interval: 1,
+                    deadlock_threshold: 200,
+                },
+                nodes,
+                membership,
+            )
+        }
         _ => {
             return Err(format!(
-                "unknown scenario {scenario:?}; expected raft, ping-pong or calm"
+                "unknown scenario {scenario:?}; expected raft, ping-pong, calm, duel-inclusion or duel-exclusion"
             ));
         }
     };
-    Ok(Header::new(scenario, 42, world, nodes, acceptors))
+    let seed = match scenario {
+        "duel-inclusion" => 331,
+        "duel-exclusion" => 1271,
+        _ => 42,
+    };
+    Ok(Header::new(scenario, seed, world, nodes, acceptors))
 }
 pub fn capture(scenario: &str, output: Box<dyn Write>) -> Result<Simulator> {
     let header = header(scenario)?;
@@ -137,6 +171,28 @@ pub fn capture(scenario: &str, output: Box<dyn Write>) -> Result<Simulator> {
         }
         let progressed = sim.run(8)?;
         sim.finalize(if progressed { "horizon" } else { "no_progress" })?;
+        return Ok(sim);
+    }
+    if matches!(scenario, "duel-inclusion" | "duel-exclusion") {
+        sim.client_message(NodeId(0), multi_paxos::propose(json!("x")))?;
+        sim.client_message(NodeId(1), multi_paxos::propose(json!("y")))?;
+        if !sim.run(28)? {
+            return Err("Duel stopped before its declared horizon".into());
+        }
+        let account = sim.check_projection()?.account();
+        if account.active_input.is_some()
+            || !account.unreached_desires.is_empty()
+            || !account.open_attempts.is_empty()
+            || !account.queued.is_empty()
+            || !account.arrived.is_empty()
+            || !account.clients.is_empty()
+            || !account.due_messages.is_empty()
+            || !account.due_ticks.is_empty()
+            || account.no_progress_due.is_some()
+        {
+            return Err("Duel horizon reached with unfinished world work".into());
+        }
+        sim.finalize("horizon")?;
         return Ok(sim);
     }
     if scenario == "raft" {

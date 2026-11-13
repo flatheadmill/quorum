@@ -40,8 +40,9 @@ cargo run --locked -- replay target/raft.jsonl
 cargo run --locked -- vote target/raft.jsonl
 ```
 
-`quorum raft`, `quorum ping-pong`, and `quorum calm` also stream directly to stdout. `capture`
-writes its tape path and prints the final projection summary on stdout.
+`quorum raft`, `quorum ping-pong`, `quorum calm`, `quorum duel-inclusion`, and
+`quorum duel-exclusion` also stream directly to stdout. `capture` writes its
+tape path and prints the final projection summary on stdout.
 `inspect`, `prefixes`, `replay`, `vote`, and `paxos-account` consume the file
 without modifying it. Usage and file I/O errors fail on stderr. The independent
 account instead returns protocol findings and world-reader errors inside its
@@ -134,6 +135,80 @@ The fixtures establish receiver behavior, not globally legal Paxos histories.
 The choice cut is the declared workload's hand-worked protocol interpretation.
 Neither those observations nor strict replay substitutes for the independent
 `paxos-account` below. It can judge the retained bytes without regenerating them.
+
+## Multi-Paxos Duel
+
+```sh
+cargo run --locked -- capture duel-inclusion target/duel-inclusion.jsonl
+cargo run --locked -- capture duel-exclusion target/duel-exclusion.jsonl
+cargo run --locked -- paxos-account target/duel-inclusion.jsonl --json
+bash scripts/check-duel.sh "$RETAINED_EVIDENCE" "$DUEL_LEVEL"
+```
+
+The validation command requires the retained Multi-Paxos evidence root and the
+exact commissioned Duel level file. It writes new artifacts under
+`target/duel-evidence/`; it never refreshes the retained answer-key inputs.
+
+Duel uses the unchanged inhabitants at nodes 0, 1 and 2, all acceptors and
+learners, with eligible proposers 0 and 1. Node 0 campaigns at `(1,0)` and
+node 1 at `(2,1)`; node 2 is inactive. Spawn order is 0, 1, 2, followed by
+tick-zero clients x to node 0 and y to node 1. Both campaigns begin on their
+first Tick. Latency is 1 through 4, ticks occur every step, initial states are
+empty, and the no-progress threshold is 200. No faults or retries are injected.
+
+| Scenario | Seed | Allocation / first admission | Observed choices |
+| --- | --- | --- | --- |
+| `duel-inclusion` | 331 | 172 / 173 | y at slot 1, line 229; x at slot 0, line 251 |
+| `duel-exclusion` | 1271 | 186 / 187 | y at slot 0, line 242 |
+
+Inclusion freezes B's reports at 106/165, including the lone old x acceptance
+at Save 114. Its answer adopts x at slot 0 before spending the waiting y at
+slot 1. Exclusion freezes two empty reports at 159/182, despite the lone old
+x acceptance at Save 126; B may use y at slot 0. Its later self-report at
+197 remains visible but cannot revise that decision. The selected schedules
+are not a one-message counterfactual or a frequency claim.
+
+At both allocation cuts, absence of choice is established by three covered
+declared-empty acceptors, no interpretation findings, and the complete
+fulfilled-acceptance inventory containing only that one old Save.
+`no_conflicting_choices` alone is not a no-choice proof. Every obligation
+present in each allocation/admission cut equals its full-run object except
+the safety summary at the cut line. Attempt origins and first Promise-quorum
+observations also match; replies, resolution and other tail-dependent fields
+are not required to match across prefixes.
+
+A's lower attempt has one Accepted and two Accept-joined Nacks. It has work in
+flight at the cuts but ends unresolved with no exact certificate and no
+current world work. Inclusion relates it to B's same-value choice; exclusion
+relates it to a different value chosen for its slot. Neither relation makes
+the lower attempt a client completion, permanent loss, or pending scheduler
+work. Before finalizing at horizon 28, the scenario requires an empty world
+account. The fixed workload's five-hop bound at maximum delay 4 explains that
+finite horizon; it is not a liveness theorem.
+
+`tests/duel.rs` also declares an evidence-only wrong-answer wrapper. It replaces
+B's inclusion answer `[x@0,y@1]` with `[y@0]` and retains only the prefix through
+the first y certificate at line 221. FIFO/drain at 169 and adoption at
+170/172/174 fail, while fresh count is one allowance spent once, gate and
+authority remain established, and the ordinary certificate is not hidden.
+There is no fabricated conflict or adopted ancestry. This wrapper is neither
+a production scenario nor a strict-replay claim for the unchanged inhabitant.
+
+The evidence command preserves the existing Raft, Ping/Pong, Calm and account
+checks, captures each honest run twice, compares bytes, runs strict replay and
+every complete-row prefix, and emits JSON/human accounts for both full tapes,
+all four decisive cuts and the declared control. Rows 2 onward must match the
+retained body hashes; only the header's scenario and implementation identity
+change. Generated manifests record source/input identities, current revision,
+representative judgments and the complete validation transcript; checksums
+cover the generated artifacts.
+
+The account retains interpretation `d8886526`; validation uses the exact
+retained `account-interpretation-d8886526.md` and promoted `account-review/`
+and `account-audit/` roots. Its accepted implementation base `97c7ad0` is
+historical provenance, recorded separately from the current validated revision.
+The Duel commission has its own pinned level identity. No account semantics
+or provenance in the account report are retargeted.
 
 ## Schema 1
 
